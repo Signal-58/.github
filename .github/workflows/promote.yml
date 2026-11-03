@@ -1,0 +1,186 @@
+# Releases a tested source-branch commit to production by fast-forwarding the
+# production branch to it. Each repository calls this from its own
+# `.github/workflows/promote.yml` (see the README).
+#
+# The production branch only ever moves forward to a commit that is already on
+# the source branch and has passed every check the production branch requires,
+# so it never gains a commit the source branch lacks.
+name: Promote
+
+on:
+  workflow_call:
+    inputs:
+      app_client_id:
+        description: Client ID of the Signal58 Promote GitHub App.
+        required: true
+        type: string
+      sha:
+        description: Source-branch commit to release. Empty releases the source branch's latest commit.
+        required: false
+        type: string
+        default: ''
+      dry_run:
+        description: Run every check and list what would ship, without moving the production branch.
+        required: false
+        type: boolean
+        default: false
+      source_branch:
+        description: Branch whose tested commits are released.
+        required: false
+        type: string
+        default: staging
+      target_branch:
+        description: Production branch that is fast-forwarded.
+        required: false
+        type: string
+        default: main
+      create_release:
+        description: Tag the release and create a GitHub Release listing its pull requests.
+        required: false
+        type: boolean
+        default: true
+    secrets:
+      PROMOTE_APP_PRIVATE_KEY:
+        description: Private key of the Signal58 Promote GitHub App.
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  promote:
+    name: Promote ${{ inputs.source_branch }} to ${{ inputs.target_branch }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    concurrency:
+      group: promote-${{ github.repository }}-${{ inputs.target_branch }}
+      cancel-in-progress: false
+    steps:
+      - name: Create Promote app token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ inputs.app_client_id }}
+          private-key: ${{ secrets.PROMOTE_APP_PRIVATE_KEY }}
+
+      - name: Check and promote
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPO: ${{ github.repository }}
+          ACTOR: ${{ github.triggering_actor }}
+          INPUT_SHA: ${{ inputs.sha }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          SOURCE: ${{ inputs.source_branch }}
+          TARGET: ${{ inputs.target_branch }}
+          CREATE_RELEASE: ${{ inputs.create_release }}
+        run: |
+          set -euo pipefail
+
+          summary() { printf '%s\n' "$@" >> "$GITHUB_STEP_SUMMARY"; }
+          fail() {
+            echo "::error::$1"
+            summary "### Promote refused" "" "$1"
+            exit 1
+          }
+
+          # 1. Only repository admins may release.
+          permission=$(gh api "repos/$REPO/collaborators/$ACTOR/permission" --jq .permission)
+          [ "$permission" = admin ] ||
+            fail "@$ACTOR's permission on $REPO is \"$permission\". Only repository admins can promote."
+
+          # 2. Resolve the commit to release.
+          source_sha=$(gh api "repos/$REPO/commits/$SOURCE" --jq .sha)
+          if [ -z "$INPUT_SHA" ]; then
+            sha=$source_sha
+          else
+            sha=$(gh api "repos/$REPO/commits/$INPUT_SHA" --jq .sha 2>/dev/null) ||
+              fail "Can't find commit $INPUT_SHA in $REPO."
+          fi
+          short=${sha:0:8}
+
+          # 3. It must already be on the source branch.
+          on_source=$(gh api "repos/$REPO/compare/$sha...$source_sha" --jq .status)
+          case "$on_source" in
+            identical | ahead) ;;
+            *) fail "$short isn't on $SOURCE. Promote only releases commits that have been merged into $SOURCE." ;;
+          esac
+
+          # 4. Every check the production branch requires must have passed on it.
+          checks=$(gh api "repos/$REPO/rules/branches/$TARGET" --paginate \
+            --jq '.[] | select(.type == "required_status_checks") | .parameters.required_status_checks[] | "\(.integration_id // "")\t\(.context)"' |
+            sort -u)
+          [ -n "$checks" ] ||
+            fail "$TARGET has no required status checks, so Promote can't tell whether $short is tested. Add a required-checks ruleset for $TARGET first."
+
+          not_passed=""
+          while IFS=$'\t' read -r app_id context; do
+            [ -n "$context" ] || continue
+            encoded=$(jq -rn --arg c "$context" '$c | @uri')
+            result=$(gh api "repos/$REPO/commits/$sha/check-runs?check_name=$encoded&per_page=100" |
+              jq -r --arg app "$app_id" \
+                '[.check_runs[] | select($app == "" or (.app.id | tostring) == $app)] | sort_by(.started_at) | last | if . == null then "" else (.conclusion // .status) end')
+            if [ -z "$result" ]; then
+              result=$(gh api "repos/$REPO/commits/$sha/status" |
+                jq -r --arg c "$context" '[.statuses[] | select(.context == $c)] | first | .state // ""')
+            fi
+            case "$result" in
+              success | neutral | skipped) ;;
+              "") not_passed+="- $context: no result"$'\n' ;;
+              *) not_passed+="- $context: $result"$'\n' ;;
+            esac
+          done <<< "$checks"
+          [ -z "$not_passed" ] ||
+            fail "$(printf 'Required checks have not passed on %s:\n\n%s' "$short" "$not_passed")"
+
+          # 5. The production branch must be able to fast-forward to it.
+          target_sha=$(gh api "repos/$REPO/commits/$TARGET" --jq .sha)
+          compare=$(gh api "repos/$REPO/compare/$target_sha...$sha")
+          case "$(jq -r .status <<< "$compare")" in
+            identical)
+              echo "::notice::$TARGET is already at $short. Nothing to promote."
+              summary "### Nothing to promote" "" "\`$TARGET\` is already at \`$short\`."
+              exit 0
+              ;;
+            ahead) ;;
+            behind) fail "$short is older than ${target_sha:0:8}, which $TARGET already runs. Promote only moves $TARGET forward; to undo a release, revert the change on $SOURCE and promote that." ;;
+            *) fail "$TARGET has commits that aren't on $SOURCE, so it can't fast-forward to $short. Merge $TARGET into $SOURCE through a pull request, then promote." ;;
+          esac
+
+          # 6. List what ships: the pull requests merged into the source branch since the last release.
+          total=$(jq -r .total_commits <<< "$compare")
+          pulls=$(jq -r '.commits[] | .commit.message | split("\n")[0] | select(test("\\(#[0-9]+\\)$")) | "- " + .' <<< "$compare")
+          [ -n "$pulls" ] || pulls="- No pull request merges found; see the compare link."
+          compare_url="https://github.com/$REPO/compare/$target_sha...$sha"
+          more=""
+          [ "$total" -le 250 ] || more="Only the first 250 of $total commits were read; see the compare link for the rest."
+
+          if [ "$DRY_RUN" = true ]; then
+            summary "### Dry run: $TARGET would move to \`$short\`" "" \
+              "Every check passed. Nothing was released." "" \
+              "**Pull requests**" "" "$pulls" "" "$more" "" "[Compare ${target_sha:0:8}...$short]($compare_url)"
+            exit 0
+          fi
+
+          # 7. Fast-forward the production branch. GitHub refuses anything that isn't a fast-forward.
+          if ! error=$(gh api -X PATCH "repos/$REPO/git/refs/heads/$TARGET" -f sha="$sha" -F force=false 2>&1); then
+            fail "GitHub refused to move $TARGET to $short: $error"
+          fi
+          summary "### Released \`$short\` to \`$TARGET\`" "" "Promoted by @$ACTOR from \`$SOURCE\`." "" \
+            "**Pull requests**" "" "$pulls" "" "$more" "" "[Compare ${target_sha:0:8}...$short]($compare_url)"
+
+          # 8. Tag it and record the release notes.
+          if [ "$CREATE_RELEASE" = true ]; then
+            day=$(date -u +%Y.%m.%d)
+            count=$(gh api "repos/$REPO/git/matching-refs/tags/release-$day-" --jq length)
+            tag="release-$day-$((count + 1))"
+            # shellcheck disable=SC2016 # the backticks are Markdown
+            body=$(printf 'Promoted by @%s from `%s` at %s.\n\n## Pull requests\n\n%s\n\n%s\n\n**Compare:** %s\n' \
+              "$ACTOR" "$SOURCE" "$sha" "$pulls" "$more" "$compare_url")
+            if gh api "repos/$REPO/releases" -f tag_name="$tag" -f target_commitish="$sha" \
+              -f name="$tag" -f body="$body" -f make_latest=true > /dev/null; then
+              summary "" "Release: [$tag](https://github.com/$REPO/releases/tag/$tag)"
+            else
+              echo "::warning::$TARGET moved to $short, but creating the $tag release failed. Create it by hand if you need the notes."
+              summary "" "$TARGET moved, but creating the $tag release failed."
+            fi
+          fi
